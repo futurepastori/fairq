@@ -178,32 +178,10 @@ func PopTasks(db *sql.DB, numTasks int) ([]Task, error) {
 	return tasks, nil
 }
 
-func RunWorker(ctx context.Context, db *sql.DB, interval time.Duration, batchSize int) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			tasks, err := PopTasks(db, batchSize)
-			if err != nil {
-				log.Printf("Error popping tasks: %v", err)
-				continue
-			}
-
-			for _, task := range tasks {
-				fmt.Printf("Task ID: %d, Status: %s, Payload: %s\n", task.ID, task.Status, task.Payload)
-			}
-		}
-	}
-}
-
 func generateTasks(batchSize int) (tasks []Task) {
 	for i := 0; i < batchSize; i++ {
 		tasks = append(tasks, Task{
-			Payload: fmt.Sprintf(`{"hello": "task%d"}`, i),
+			Payload: fmt.Sprintf(`{"id": "task%d"}`, i),
 		})
 	}
 
@@ -232,14 +210,16 @@ func main() {
 
 		fmt.Printf("added %d tasks", len(tasks))
 	case "worker":
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		srv, err := NewServer(connStr, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
 
-		interval := 1 * time.Second
-		tasksPerInterval := 25
+		srv.RunHandler(func(ctx context.Context, task *Task) error {
+			fmt.Println(time.Now().Format(time.DateTime), task.TaskGroupID, task.Status, task.Payload)
 
-		RunWorker(ctx, db, interval, tasksPerInterval)
-
+			return nil
+		})
 	default:
 		log.Fatal("invalid mode: use 'insert' or 'worker'")
 	}
