@@ -3,21 +3,18 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
 )
 
-type TaskGroup struct {
-	ID          int64
-	LookupKey   string
-	MaxAssigned int64
-}
+const GROUP_OFFSET = 1 << 20
 
 type Task struct {
 	ID          int64
@@ -27,133 +24,114 @@ type Task struct {
 	Payload     string
 }
 
-var offset = 1 << 20
-var numTasks int
-
-func init() {
-	tasksEnv := os.Getenv("NUM_TASKS")
-	if tasksEnv == "" {
-		numTasks = 10
-	} else {
-		parsedTasks, err := strconv.Atoi(tasksEnv)
-		if err != nil {
-			log.Printf("Invalid TASKS value: %s. Defaulting to 10.", tasksEnv)
-			numTasks = 103
-		} else {
-			numTasks = parsedTasks
-		}
-	}
+type TaskGroup struct {
+	ID          int64
+	LookupKey   string
+	MaxAssigned int64
 }
 
-func main() {
-	connStr := "user=victor dbname=fairq sslmode=disable"
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	lookup := os.Getenv("LOOKUP_KEY")
-	mode := os.Getenv("MODE")
-
-	if mode == "insert" {
-		var tasks []Task
-		for i := 0; i < numTasks; i++ {
-			tasks = append(tasks, Task{
-				Payload: fmt.Sprintf(`{"hello": "task%d"}`, i),
-			})
-		}
-		err = createTasks(db, lookup, tasks)
-		if err != nil {
-			log.Fatal("Error creating tasks:", err)
-		}
-		fmt.Printf("Successfully inserted %d tasks\n", len(tasks))
-	} else if mode == "worker" {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		interval := 1 * time.Second // Pop tasks every 5 seconds
-		tasksPerInterval := 25      // Number of tasks to pop each time
-
-		fmt.Printf("Starting worker. Popping up to %d tasks every %s\n", tasksPerInterval, interval)
-		popTasksPeriodically(ctx, db, interval, tasksPerInterval)
-	} else {
-		log.Fatal("Invalid mode. Use 'insert' or 'worker'")
-	}
+type SafeGroup struct {
+	mu        sync.Mutex
+	taskGroup TaskGroup
 }
 
-func createTasks(db *sql.DB, lookupKey string, tasks []Task) error {
-	// Step 1: Get or create group based on lookup key
-	selectQuery := `
+var safeGroupLocks sync.Map
+
+func (s *SafeGroup) RefreshGroup(db *sql.DB) error {
+	query := `
 		SELECT id, lookup_key, max_assigned
 		FROM task_groups
 		WHERE lookup_key = $1
 		LIMIT 1;
-	`
+  `
+	err := db.QueryRow(query, s.taskGroup.LookupKey).Scan(
+		&s.taskGroup.ID,
+		&s.taskGroup.LookupKey,
+		&s.taskGroup.MaxAssigned,
+	)
 
-	var taskGroup TaskGroup
-	err := db.QueryRow(selectQuery, lookupKey).Scan(&taskGroup.ID, &taskGroup.LookupKey, &taskGroup.MaxAssigned)
-
-	if err == sql.ErrNoRows {
-		// Group doesn't exist, so insert a new one
-		insertQuery := `
+	if errors.Is(err, sql.ErrNoRows) {
+		query := `
 			INSERT INTO task_groups (lookup_key)
 			VALUES ($1)
 			RETURNING id, lookup_key, max_assigned;
 		`
-		err = db.QueryRow(insertQuery, lookupKey).Scan(&taskGroup.ID, &taskGroup.LookupKey, &taskGroup.MaxAssigned)
-		if err != nil {
-			log.Fatal("can't insert new group", err)
-			return err
-		}
-	} else if err != nil {
-		log.Fatal("can't get group", err)
-		return err
+		err = db.QueryRow(query, s.taskGroup.LookupKey).Scan(
+			&s.taskGroup.ID,
+			&s.taskGroup.LookupKey,
+			&s.taskGroup.MaxAssigned,
+		)
 	}
-
-	greatest := taskGroup.MaxAssigned
-	var insertValueRows []string
-
-	// Step 2: Add the tasks into a single insert statement
-	for idx, task := range tasks {
-		taskId := ((taskGroup.MaxAssigned + int64(idx)) * int64(offset)) + taskGroup.ID
-
-		valueRow := fmt.Sprintf("(%d, %d, '%s')", taskId, taskGroup.ID, task.Payload)
-		insertValueRows = append(insertValueRows, valueRow)
-
-		greatest += 1
-	}
-
-	insertQuery := `
-		INSERT INTO
-			tasks (id, task_group_id, payload)
-		VALUES
-			%s;
-	`
-
-	insertStatements := strings.Join(insertValueRows, ",\n")
-
-	_, err = db.Exec(fmt.Sprintf(insertQuery, insertStatements))
-	if err != nil {
-		return err
-	}
-
-	updateGroupQuery := `
-		UPDATE task_groups
-		SET max_assigned = ($2)
-		WHERE lookup_key = ($1)
-	`
-
-	_, err = db.Exec(updateGroupQuery, lookupKey, greatest)
 
 	if err != nil {
-		return err
+		return fmt.Errorf("can't create or refresh group: %w", err)
 	}
 
 	return nil
 }
 
-func popTasks(db *sql.DB, numTasks int) ([]Task, error) {
+func (s *SafeGroup) UpdateMaxAssigned(db *sql.DB, maxAssigned int64) error {
+	query := `
+		UPDATE task_groups
+		SET max_assigned = $1
+		WHERE lookup_key = $2
+	`
+	_, err := db.Exec(query, maxAssigned, s.taskGroup.LookupKey)
+
+	if err != nil {
+		return fmt.Errorf("can't update max assigned task to db: %w", err)
+	}
+
+	return nil
+}
+
+func CreateTasks(db *sql.DB, lookupKey string, tasks []Task) error {
+	lockValue, _ := safeGroupLocks.LoadOrStore(lookupKey, &SafeGroup{
+		taskGroup: TaskGroup{
+			LookupKey: lookupKey,
+		},
+	})
+
+	lock := lockValue.(*SafeGroup)
+	lock.mu.Lock()
+	defer lock.mu.Unlock()
+
+	err := lock.RefreshGroup(db)
+	if err != nil {
+		return fmt.Errorf("error refreshing group on createtasks: %w", err)
+	}
+
+	insertQuery := `
+		INSERT INTO
+				tasks (id, task_group_id, payload, status)
+		VALUES
+				%s;
+	`
+	insertValueRows := make([]string, len(tasks))
+
+	for idx, task := range tasks {
+		taskId := ((lock.taskGroup.MaxAssigned + int64(idx) + 1) * GROUP_OFFSET) + lock.taskGroup.ID
+
+		insertRow := fmt.Sprintf("(%d, %d, '%s', 'queued')", taskId, lock.taskGroup.ID, task.Payload)
+		insertValueRows[idx] = insertRow
+	}
+
+	_, err = db.Exec(fmt.Sprintf(insertQuery, strings.Join(insertValueRows, ",\n")))
+	if err != nil {
+		return fmt.Errorf("error inserting tasks to db: %w", err)
+	}
+
+	newMaxAssigned := lock.taskGroup.MaxAssigned + int64(len(tasks))
+	err = lock.UpdateMaxAssigned(db, newMaxAssigned)
+
+	if err != nil {
+		return fmt.Errorf("could not update maxAssigned: %w", err)
+	}
+
+	return nil
+}
+
+func PopTasks(db *sql.DB, numTasks int) ([]Task, error) {
 	query := `
 		WITH target_tasks AS (
 			SELECT
@@ -200,7 +178,7 @@ func popTasks(db *sql.DB, numTasks int) ([]Task, error) {
 	return tasks, nil
 }
 
-func popTasksPeriodically(ctx context.Context, db *sql.DB, interval time.Duration, numTasks int) {
+func RunWorker(ctx context.Context, db *sql.DB, interval time.Duration, batchSize int) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -209,15 +187,60 @@ func popTasksPeriodically(ctx context.Context, db *sql.DB, interval time.Duratio
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tasks, err := popTasks(db, numTasks)
+			tasks, err := PopTasks(db, batchSize)
 			if err != nil {
 				log.Printf("Error popping tasks: %v", err)
 				continue
 			}
-			fmt.Printf("Popped %d tasks\n", len(tasks))
+
 			for _, task := range tasks {
 				fmt.Printf("Task ID: %d, Status: %s, Payload: %s\n", task.ID, task.Status, task.Payload)
 			}
 		}
+	}
+}
+
+func generateTasks(batchSize int) (tasks []Task) {
+	for i := 0; i < batchSize; i++ {
+		tasks = append(tasks, Task{
+			Payload: fmt.Sprintf(`{"hello": "task%d"}`, i),
+		})
+	}
+
+	return tasks
+}
+
+func main() {
+	connStr := "user=victor dbname=fairq sslmode=disable"
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	lookupKey := os.Getenv("LOOKUP_KEY")
+	mode := os.Getenv("MODE")
+
+	switch mode {
+	case "insert":
+		tasks := generateTasks(100)
+
+		err := CreateTasks(db, lookupKey, tasks)
+		if err != nil {
+			log.Fatalln("error creating tasks:", err)
+		}
+
+		fmt.Printf("added %d tasks", len(tasks))
+	case "worker":
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		interval := 1 * time.Second
+		tasksPerInterval := 25
+
+		RunWorker(ctx, db, interval, tasksPerInterval)
+
+	default:
+		log.Fatal("invalid mode: use 'insert' or 'worker'")
 	}
 }
