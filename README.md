@@ -12,7 +12,7 @@ a postgres-based fair task queue for multi-tenant thingies
 - [x] minimal worker
 - [x] lock task addition by lookup key
 - [x] callback
-- [ ] drop tasks / update as 'failed' on callback result
+- [x] drop tasks / update as 'failed' on callback result
 - [ ] fault tolerance
 - [ ] queue monitoring
 - [ ] standalone binary server

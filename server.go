@@ -173,3 +173,17 @@ func (s *Server) flushDiscarded(flushBatch *([]*Task)) {
 func (s *Server) DiscardTask(task *Task) {
 	s.Flush.FlushableTasks <- task
 }
+
+func updateTaskAsFailed(db *sql.DB, task *Task) error {
+	query := `
+		UPDATE tasks
+		SET status = 'failed'
+		WHERE id = $1
+	`
+
+	if _, err := db.Exec(query, task.ID); err != nil {
+		return fmt.Errorf("couldn't update failed task status: %w", err)
+	}
+
+	return nil
+}
