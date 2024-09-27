@@ -3,14 +3,25 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
+	"sync"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 type Server struct {
 	Context *context.Context
 	DB      *sql.DB
 	Config  *ServerConfig
+
+	Flush Flush
+}
+
+type Flush struct {
+	FlushableTasks chan *Task
+	mu             sync.Mutex
 }
 
 type ServerConfig struct {
@@ -46,27 +57,40 @@ func NewServer(connString string, config *ServerConfig) (*Server, error) {
 
 	srv.Config = config
 
+	srv.Flush.FlushableTasks = make(chan *Task, srv.Config.batchSize)
+
 	return srv, nil
 }
 
 func (s *Server) RunHandler(handler HandlerFunc) error {
 	ctx := *s.Context
 
-	resultChan := make(chan Task, s.Config.batchSize)
+	resultChan := make(chan *Task, s.Config.batchSize)
 
-	go s.runTicker(resultChan)
+	go s.initTicker(resultChan)
+	go s.initFlusher()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case task := <-resultChan:
-			handler(ctx, &task)
+			err := handler(ctx, task)
+
+			if err != nil {
+				err := updateTaskAsFailed(s.DB, task)
+
+				if err != nil {
+					log.Println(err)
+				}
+			} else {
+				s.DiscardTask(task)
+			}
 		}
 	}
 }
 
-func (s *Server) runTicker(RC chan Task) {
+func (s *Server) initTicker(RC chan *Task) {
 	ctx := *s.Context
 
 	ticker := time.NewTicker(s.Config.interval)
@@ -75,17 +99,77 @@ func (s *Server) runTicker(RC chan Task) {
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println(time.Now(), "context must be done")
+
 			return
 		case <-ticker.C:
 			tasks, err := PopTasks(s.DB, s.Config.batchSize)
+
+			log.Println(time.Now(), fmt.Sprintf("popped %d tasks", len(tasks)))
+
 			if err != nil {
 				log.Printf("Error popping tasks: %v", err)
 				continue
 			}
 
 			for _, task := range tasks {
-				RC <- task
+				RC <- &task
 			}
 		}
 	}
+}
+
+func (s *Server) initFlusher() {
+	const flushBatchSize = 1000
+	var flushBatch []*Task
+
+	for {
+		select {
+		case task := <-s.Flush.FlushableTasks:
+			flushBatch = append(flushBatch, task)
+
+			if len(flushBatch) >= flushBatchSize {
+				s.flushDiscarded(&flushBatch)
+
+				flushBatch = []*Task{}
+			}
+
+		case <-time.After(2 * time.Second):
+			s.flushDiscarded(&flushBatch)
+
+			flushBatch = []*Task{}
+		}
+	}
+}
+
+func (s *Server) flushDiscarded(flushBatch *([]*Task)) {
+	isLocked := s.Flush.mu.TryLock()
+	if !isLocked {
+		return
+	}
+
+	defer s.Flush.mu.Unlock()
+
+	if len(*flushBatch) == 0 {
+		return
+	}
+
+	taskIds := make([]int64, len(*flushBatch))
+	for idx, task := range *flushBatch {
+		taskIds[idx] = task.ID
+	}
+
+	query := `
+		UPDATE tasks
+		SET status = 'completed'
+		WHERE id = ANY($1)
+	`
+
+	if _, err := s.DB.Exec(query, pq.Array(taskIds)); err != nil {
+		log.Println(time.Now().Format(time.DateTime), fmt.Errorf("error updating tasks as completed to db: %w", err))
+	}
+}
+
+func (s *Server) DiscardTask(task *Task) {
+	s.Flush.FlushableTasks <- task
 }

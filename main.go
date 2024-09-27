@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -188,6 +189,20 @@ func generateTasks(batchSize int) (tasks []Task) {
 	return tasks
 }
 
+func updateTaskAsFailed(db *sql.DB, task *Task) error {
+	query := `
+		UPDATE tasks
+		SET status = 'failed'
+		WHERE id = $1
+	`
+
+	if _, err := db.Exec(query, task.ID); err != nil {
+		return fmt.Errorf("couldn't update failed task status: %w", err)
+	}
+
+	return nil
+}
+
 func main() {
 	connStr := "user=victor dbname=fairq sslmode=disable"
 	db, err := sql.Open("postgres", connStr)
@@ -216,9 +231,15 @@ func main() {
 		}
 
 		srv.RunHandler(func(ctx context.Context, task *Task) error {
-			fmt.Println(time.Now().Format(time.DateTime), task.TaskGroupID, task.Status, task.Payload)
+			if rand.Float32() < 0.2 {
+				err := fmt.Errorf("dummy error from handler run")
 
-			return nil
+				log.Println(err)
+				return err
+			} else {
+				fmt.Println(time.Now().Format(time.DateTime), task.TaskGroupID, task.Status, task.Payload)
+				return nil
+			}
 		})
 	default:
 		log.Fatal("invalid mode: use 'insert' or 'worker'")
