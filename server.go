@@ -25,8 +25,8 @@ type Flush struct {
 }
 
 type ServerConfig struct {
-	interval  time.Duration
-	batchSize int
+	Interval  time.Duration
+	BatchSize int
 }
 
 type HandlerFunc func(ctx context.Context, task *Task) error
@@ -50,14 +50,14 @@ func NewServer(connString string, config *ServerConfig) (*Server, error) {
 
 	if config == nil {
 		config = &ServerConfig{
-			interval:  5 * time.Second,
-			batchSize: 10,
+			Interval:  5 * time.Second,
+			BatchSize: 10,
 		}
 	}
 
 	srv.Config = config
 
-	srv.Flush.FlushableTasks = make(chan *Task, srv.Config.batchSize)
+	srv.Flush.FlushableTasks = make(chan *Task, srv.Config.BatchSize)
 
 	return srv, nil
 }
@@ -65,7 +65,7 @@ func NewServer(connString string, config *ServerConfig) (*Server, error) {
 func (s *Server) RunHandler(handler HandlerFunc) error {
 	ctx := *s.Context
 
-	resultChan := make(chan *Task, s.Config.batchSize)
+	resultChan := make(chan *Task, s.Config.BatchSize)
 
 	go s.initTicker(resultChan)
 	go s.initFlusher()
@@ -93,7 +93,7 @@ func (s *Server) RunHandler(handler HandlerFunc) error {
 func (s *Server) initTicker(RC chan *Task) {
 	ctx := *s.Context
 
-	ticker := time.NewTicker(s.Config.interval)
+	ticker := time.NewTicker(s.Config.Interval)
 	defer ticker.Stop()
 
 	for {
@@ -103,7 +103,7 @@ func (s *Server) initTicker(RC chan *Task) {
 
 			return
 		case <-ticker.C:
-			tasks, err := PopTasks(s.DB, s.Config.batchSize)
+			tasks, err := PopTasks(s.DB, s.Config.BatchSize)
 
 			log.Println(time.Now(), fmt.Sprintf("popped %d tasks", len(tasks)))
 

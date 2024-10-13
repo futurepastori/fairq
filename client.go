@@ -28,7 +28,3 @@ func (c *Client) NewClient(opts NewClientOpts) (*Client, error) {
 
 	return client, nil
 }
-
-func (c *Client) AddTasks(lookupKey string, tasks []Task) {
-
-}
