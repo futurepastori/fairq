@@ -60,6 +60,15 @@ func main() {
 				return nil
 			}
 		})
+
+	case "monitor":
+		mon, err := NewMonitor(connStr, 5*time.Second)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		mon.RunMonitor()
+
 	default:
 		log.Fatal("invalid mode: use 'insert' or 'worker'")
 	}
