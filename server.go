@@ -25,8 +25,9 @@ type Flush struct {
 }
 
 type ServerConfig struct {
-	Interval  time.Duration
-	BatchSize int
+	Interval           time.Duration
+	BatchSize          int
+	MaxConcurrentTasks int
 }
 
 type HandlerFunc func(ctx context.Context, task *Task) error
@@ -70,22 +71,34 @@ func (s *Server) RunHandler(handler HandlerFunc) error {
 	go s.initTicker(resultChan)
 	go s.initFlusher()
 
+	// Create a semaphore to limit concurrent goroutines
+	sem := make(chan struct{}, s.Config.MaxConcurrentTasks)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case task := <-resultChan:
-			err := handler(ctx, task)
+			// Acquire a semaphore slot
+			sem <- struct{}{}
 
-			if err != nil {
-				err := updateTaskAsFailed(s.DB, task)
+			go func(t *Task) {
+				defer func() {
+					// Release the semaphore slot when done
+					<-sem
+				}()
+
+				err := handler(ctx, t)
 
 				if err != nil {
-					log.Println(err)
+					updateErr := updateTaskAsFailed(s.DB, t)
+					if updateErr != nil {
+						log.Println(updateErr)
+					}
+				} else {
+					s.DiscardTask(t)
 				}
-			} else {
-				s.DiscardTask(task)
-			}
+			}(task)
 		}
 	}
 }
