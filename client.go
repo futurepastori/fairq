@@ -15,7 +15,7 @@ type NewClientOpts struct {
 	dsn string
 }
 
-func (c *Client) NewClient(opts NewClientOpts) (*Client, error) {
+func NewClient(opts NewClientOpts) (*Client, error) {
 	db, err := sql.Open("postgres", opts.dsn)
 
 	if err != nil {
@@ -27,4 +27,12 @@ func (c *Client) NewClient(opts NewClientOpts) (*Client, error) {
 	}
 
 	return client, nil
+}
+
+func (c *Client) Close() error {
+	return c.db.Close()
+}
+
+func (c *Client) CreateTasks(lookupKey string, tasks []Task) error {
+	return CreateTasks(c.db, lookupKey, tasks)
 }
