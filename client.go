@@ -12,11 +12,11 @@ type Client struct {
 }
 
 type NewClientOpts struct {
-	dsn string
+	Dsn string
 }
 
 func NewClient(opts NewClientOpts) (*Client, error) {
-	db, err := sql.Open("postgres", opts.dsn)
+	db, err := sql.Open("postgres", opts.Dsn)
 
 	if err != nil {
 		return nil, fmt.Errorf("error creating fairq client: %w", err)
